@@ -65,6 +65,12 @@ resource "aws_security_group" "route53_resolver" {
 }
 ```
 
+### DNSのポートとプロトコル
+
+- **UDP/53 が基本**: 通常のDNSクエリはUDP/53で送信される。
+- **TCP/53 も必要**: 応答が大きい場合や再送時にTCPへフォールバックする。
+- **ポート53が標準**: 特殊構成でDNSサーバーが別ポートを使う場合のみ変更を検討する。
+
 ### 2. Outbound Endpoint
 
 ```hcl
@@ -81,6 +87,11 @@ resource "aws_route53_resolver_endpoint" "outbound" {
   }
 }
 ```
+
+### 高可用性の考え方
+
+- **複数AZに配置**: サブネットごとにENIが作られ、AZ障害時もDNS解決を継続できる。
+- **単一障害点の回避**: 1サブネットのみだとそのAZ障害でResolverが停止する。
 
 ### 3. Resolver Rule
 
