@@ -13,6 +13,21 @@ SQL Server の `STRING_AGG` 関数で集計結果が 8000 バイトを超える�
 STRING_AGG 集計結果が 8000 バイトの上限を超えています。結果の切り捨てを防止するには LOB 型をお使いください。 (9829) (SQLFetch)')
 ```
 
+### LOB型とは
+
+LOB（Large Object）型は、SQL Server で大容量データを格納するためのデータ型の総称。通常のデータ型には格納サイズの上限があるが、LOB 型はそれを大幅に超えるデータを扱える。
+
+| 型 | 分類 | 最大サイズ |
+|----|------|-----------|
+| `VARCHAR(MAX)` | 文字列 LOB | 約 2GB |
+| `NVARCHAR(MAX)` | Unicode 文字列 LOB | 約 2GB |
+| `VARBINARY(MAX)` | バイナリ LOB | 約 2GB |
+| `TEXT` / `NTEXT` / `IMAGE` | レガシー LOB（非推奨） | 約 2GB |
+
+通常の `VARCHAR(n)` / `NVARCHAR(n)` は最大 8000 バイト / 4000 文字までだが、`MAX` 指定にすることで LOB 型となり最大約 2GB まで格納可能になる。
+
+`STRING_AGG` のエラーメッセージで言及される「LOB 型をお使いください」とは、入力を `NVARCHAR` にキャストして戻り値を `NVARCHAR(MAX)` に昇格させることを意味する。
+
 ### 原因
 
 `STRING_AGG` の戻り値の型は、入力の型によって決まる：
