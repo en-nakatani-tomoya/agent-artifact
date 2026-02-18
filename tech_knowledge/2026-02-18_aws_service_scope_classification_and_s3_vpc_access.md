@@ -33,14 +33,21 @@ S3はVPCに属さないリージョナルサービスのため、VPC Peeringは�
 
 ## 構造イメージ
 
+```
 AWS Global
-├── IAM, Route 53, CloudFront ← グローバル
+├── IAM, Route 53, CloudFront        ← グローバルサービス
+│
 └── Region (ap-northeast-1)
-    ├── S3, DynamoDB, SQS ← リージョナル（VPC外）
+    ├── S3, DynamoDB, SQS            ← リージョナルサービス（VPC外）
+    │
     └── VPC
-        ├── ALB, NAT Gateway ← VPC内
-        ├── AZ-a → EC2, EBS
-        └── AZ-c → EC2, EBS
+        ├── ALB, NAT Gateway         ← VPC内サービス
+        │
+        ├── AZ-a
+        │   └── EC2, EBS             ← AZサービス
+        └── AZ-c
+            └── EC2, EBS
+```
 
 ---
 Generated: 2026-02-18
