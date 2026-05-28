@@ -1,20 +1,20 @@
-# CloudWatch Metric Streams Include Filter Cardinality Reduction
+# CloudWatch Metric Streams Metric Name Filtering Cost Reduction
 
 ## 概要
-CloudWatch Metric Streams の include_filter を Terraform で管理し、namespace と metric name を明示的に絞ることで、外部監視基盤へ流すメトリクス量とカーディナリティを制御する方法を整理する。
+CloudWatch Metric Streams の include_filter / exclude_filter を Terraform で管理し、namespace 単位ではなく metric name 単位で送信対象を絞ることで、CloudWatch metric update と外部監視基盤への取り込み量を入口で削減する方法を整理する。
 
 ## 詳細
-# CloudWatch Metric Streams の include_filter でメトリクス量を制御する
+### CloudWatch Metric Streams のコストは「入口」で決まる
 
-## 背景
+CloudWatch Metric Streams は、CloudWatch メトリクスを外部監視基盤やデータレイクへ継続的に送る仕組みである。設定を広く取りすぎると、実際には見ていないメトリクスまでストリーミング対象になり、CloudWatch の metric update と外部監視基盤側の取り込み量が増える。
 
-監視基盤に送るメトリクスは、多ければ多いほどよいとは限らない。クラウド環境では、サービスごとに大量のメトリクスが自動生成される。全namespace・全metricを外部監視基盤へストリーミングすると、実際には使っていないメトリクスまで取り込み対象になり、可視化やアラートに使う前からデータ量が増える。
+ここで重要なのは、単に namespace 単位で対象を選ぶだけでは粗いという点である。AWS は Metric Streams のフィルタリングを metric name 単位にも拡張しており、特定 namespace の中から送る metric name だけを include したり、逆に不要な metric name だけを exclude したりできる。
 
-この問題に対して有効なのが、CloudWatch Metric Streams の include filter である。AWSの発表では、Metric Streams はもともとnamespace単位でinclude/excludeでき、現在はmetric name単位のフィルタリングにも対応している。つまり、「AWS/ECS は送るが CPUUtilization と MemoryUtilization だけにする」「AWS/RDS は必要な数個のメトリクスだけ送る」といった制御ができる。
+つまり、コスト削減の主戦場は「どのAWSサービスのメトリクスを送るか」だけではなく、「その namespace のどの metric name を送るか」にある。
 
-## Terraformでの基本形
+### Terraform で metric name 単位に include する
 
-Terraformでは `aws_cloudwatch_metric_stream` に `include_filter` を指定する。以下は一般化した例である。
+Terraform では `aws_cloudwatch_metric_stream` の `include_filter` に `metric_names` を指定する。これにより、namespace 全体ではなく、必要な metric name だけをストリーミングできる。
 
 ```hcl
 resource "aws_cloudwatch_metric_stream" "observability" {
@@ -38,23 +38,40 @@ resource "aws_cloudwatch_metric_stream" "observability" {
       "TargetResponseTime",
     ]
   }
+}
+```
 
-  include_filter {
-    namespace = "AWS/RDS"
+この例では、`AWS/ECS` namespace を丸ごと送っていない。ECS のメトリクスのうち、運用上見る必要がある `CPUUtilization` と `MemoryUtilization` だけを送っている。同様に、Application Load Balancer も 5xx と応答時間に限定している。
+
+この差は大きい。namespace 単位の include は「そのAWSサービスに属するメトリクスを広く送る」設定になりやすい。一方、metric name 単位の include は「実際にアラートやダッシュボードで使うメトリクスだけを送る」設定になる。
+
+### exclude_filter は「大半は送るが一部だけ落とす」ときに使う
+
+送信対象のほとんどを使う namespace では、`include_filter` で列挙するより `exclude_filter` の方が読みやすい場合がある。
+
+```hcl
+resource "aws_cloudwatch_metric_stream" "observability" {
+  name          = "observability-metric-stream"
+  role_arn      = aws_iam_role.metric_stream_to_firehose.arn
+  firehose_arn  = aws_kinesis_firehose_delivery_stream.metrics.arn
+  output_format = "opentelemetry1.0"
+
+  exclude_filter {
+    namespace = "AWS/Usage"
     metric_names = [
-      "CPUUtilization",
-      "DatabaseConnections",
-      "FreeStorageSpace",
+      "CallCount",
     ]
   }
 }
 ```
 
-この書き方のポイントは、送信対象を「監視基盤に存在するすべてのCloudWatchメトリクス」ではなく、「運用上使うnamespaceとmetric nameのリスト」に限定することにある。
+`include_filter` は「必要なものだけを送る」設計に向いている。`exclude_filter` は「基本的には送るが、ノイズや高コストな一部だけ落とす」設計に向いている。
 
-## include filter を locals で管理する
+注意点として、CloudWatch Metric Streams のAPIでは include filters と exclude filters を同じ操作に混在させない前提になっている。設計としても、基本方針はどちらかに寄せる方がよい。コスト削減を目的に始めるなら、通常は allowlist としての `include_filter` から始める方が安全である。
 
-実運用では、`include_filter` を直接並べるよりも、対象namespaceとmetric nameを `locals` で管理した方がレビューしやすい。
+### locals で「送る metric name」をレビュー可能にする
+
+実運用では、`include_filter` を直接並べるより、namespace と metric name の対応を `locals` に寄せると意図が見えやすい。
 
 ```hcl
 locals {
@@ -94,62 +111,57 @@ resource "aws_cloudwatch_metric_stream" "observability" {
 }
 ```
 
-この形にすると、Pull Requestでは「どのnamespaceを追加したか」「そのnamespaceでどのmetric nameを送るか」だけを確認しやすい。監視基盤の設定変更を、コードレビューで扱える単位に分解できる。
+この形にすると、Pull Request では「どの namespace の、どの metric name を送るのか」だけを確認できる。レビューの論点が、監視基盤の細かい配線ではなく、送信対象メトリクスの妥当性に集中する。
 
-## なぜメトリクス量が減るのか
+### metric update は metric name の段階で大きく減らせる
 
-Metric Streams の出力量は、概念的には次の要素で増える。
+Metric Streams の出力量は、概念的には次の掛け算で増える。
 
 ```text
-出力メトリクス量 = namespace数 * metric name数 * dimension組み合わせ数 * 統計値数
+metric update 量 = namespace数 * metric name数 * dimension組み合わせ数 * 統計値数
 ```
 
-CloudWatchメトリクスはdimensionを持つ。たとえばALBであればLoadBalancerやTargetGroup、ECSであればClusterNameやServiceName、RDSであればDBInstanceIdentifierのような軸がある。namespaceを丸ごと送ると、そのnamespaceに含まれる多くのmetric nameとdimensionの組み合わせが対象になる。
+CloudWatch メトリクスは dimension を持つ。たとえば ALB であれば LoadBalancer や TargetGroup、ECS であれば ClusterName や ServiceName、RDS であれば DBInstanceIdentifier のような軸がある。namespace を丸ごと送ると、その namespace に含まれる多数の metric name と dimension の組み合わせが stream 対象になる。
 
-include filter は、この掛け算のうち `namespace数` と `metric name数` を先に絞る。dimensionの数そのものを直接消すわけではないが、不要なmetric nameを送らないだけで、外部監視基盤へ流れる系列数を大きく減らせる。
+`include_filter.metric_names` は、この掛け算のうち `metric name数` を入口で減らす。dimension が多い metric name を送らなければ、その metric name に付随する dimension 組み合わせも後段へ流れない。
 
-たとえば、あるnamespaceに100個のmetric nameがあり、そのうち運用で実際に使うものが10個だけなら、metric nameの段階で90%を除外できる。さらに、アラートやダッシュボードに必要なnamespaceだけに限定できる場合、全体の削減幅はさらに大きくなる。
+たとえば、ある namespace に 100 個の metric name があり、実際にアラートやダッシュボードで使うものが 10 個だけなら、metric name の段階で 90% を除外できる。dimension が多い metric name を除外できる場合、metric update の削減効果はさらに大きくなる。
 
-## 一般的な削減幅の考え方
+ここでのポイントは、外部監視基盤に入った後でクエリやダッシュボードを整理するのでは遅いということだ。stream の入口で送信対象を絞れば、CloudWatch 側の metric update、Firehose 経由の転送、外部監視基盤側の取り込み、保存、インデックス、アラート評価のすべてが軽くなる。
 
-削減率は環境によって変わるため、固定値では語れない。ただし、公開情報とメトリクスの構造から、次のように見積もれる。
+### namespace 単位の制限だけでは不十分な理由
 
-- 未使用namespaceを送らない: 使っていないAWSサービス分のメトリクスを丸ごと削減できる。
-- namespace内でmetric nameを絞る: 利用metric name数 / 全metric name数 に近い比率まで削減できる。
-- 高dimensionのmetric nameを除外する: dimension組み合わせが多いmetricほど削減効果が大きい。
-- histogramやdistribution系の外部監視メトリクスを減らす: 監視基盤側で複数系列に展開される場合、倍率分の効果が出る。
+namespace 単位のフィルタは、最初の整理としては有効である。使っていない AWS サービスの namespace を送らないだけでも、不要な metric update は減る。
 
-Datadogは、未使用メトリクスにMetrics without Limitsを適用した顧客で、可視性を大きく損なわず最大70%程度のcustom metrics usage削減が見られるとしている。これはCloudWatch Metric Streamsそのものの削減率ではないが、「使っていないメトリクスやタグを取り込み・インデックス対象から外すと数十%規模で減る」ことの参考になる。
+しかし、実際のコストを押し下げるには、namespace 内部の metric name まで見た方がよい。多くの運用では、ある AWS サービスのすべてのメトリクスを見るわけではない。アラートに使う数個のメトリクス、ダッシュボードに使う数個のメトリクス、調査時だけたまに見るメトリクスが混在している。
 
-一方で、APMのトランザクション粒度や高dimensionのカスタムメトリクスを、サービス単位・リソース単位の代表メトリクスに置き換える場合は、90%以上削減されるケースもあり得る。これは、100個のエンドポイントを数個のサービスメトリクスに集約するような場合に、系列数が桁で変わるためである。
+Metric Streams は常時送信の仕組みなので、「調査時だけ見るかもしれない」メトリクスまで常時 stream するかは慎重に決めるべきである。必要になったときに CloudWatch 側で直接確認できるメトリクスまで、常時外部へ転送する必要はない場合が多い。
 
-## 設計の勘所
+### 設計の勘所
 
-include filter を使うときは、単に少なくするのではなく、監視の目的から逆算する。
+Metric Streams のフィルタ設計では、次の順で考えるとよい。
 
-- アラートに使うmetric nameを先に決める。
-- ダッシュボードで見るmetric nameを次に決める。
-- 調査時だけ必要な詳細メトリクスは、常時streamする必要があるかを確認する。
-- 高dimensionのmetric nameは、送る前に本当に使うか確認する。
-- include filter の変更はTerraformでレビューし、手作業で対象を増やさない。
-- 出力量そのものをCloudWatchや監視SaaS側で定期的に確認する。
+- まずアラートに使う metric name を列挙する。
+- 次に主要ダッシュボードで常時見る metric name を追加する。
+- 調査時だけ見る metric name は、常時 stream する必要があるかを確認する。
+- dimension 組み合わせが多い metric name は、送信対象に入れる前に用途を確認する。
+- 基本方針は `include_filter` による allowlist とし、例外的に落としたいものが明確な場合だけ `exclude_filter` を検討する。
+- namespace と metric name の対応は Terraform の locals などで管理し、レビュー可能にする。
 
-特に、include filter は「今見えているものを削る」操作ではなく、「監視基盤へ送る入口を設計する」操作として扱うとよい。入口で絞ると、後段の保存、インデックス、クエリ、アラート評価のすべてが軽くなる。
+この設計にすると、監視基盤の入口で「送るべきメトリクス」と「送らなくてよいメトリクス」を明確に分けられる。
 
-## まとめ
+### まとめ
 
-CloudWatch Metric Streams の `include_filter` は、監視コストとメトリクスカーディナリティを制御するための入口設計である。Terraformでnamespaceとmetric nameを明示すれば、監視対象をコードレビュー可能にしながら、不要なメトリクスのストリーミングを避けられる。
+CloudWatch Metric Streams のコスト削減で重要なのは、namespace 単位の制御に留めず、metric name 単位で stream 対象を制限することである。Terraform の `aws_cloudwatch_metric_stream` では、`include_filter` や `exclude_filter` の `metric_names` を使って、この制御をコード化できる。
 
-一般的には、未使用namespace・未使用metric nameの除外だけでも数十%規模の削減が期待できる。高dimensionのメトリクスやAPM由来の細かい系列を、サービス単位・リソース単位の代表メトリクスへ寄せる場合は、90%以上の削減も起こり得る。
+特に `include_filter.metric_names` を allowlist として使うと、外部監視基盤へ送る CloudWatch metric update を入口で削減できる。ある namespace のうち実際に使う metric name が 10% なら、metric name の段階で 90% を除外できる。高 dimension の metric name を除外できる場合、後段に流れる系列数と取り込み量への効果はさらに大きい。
 
-ただし、削減率は環境依存である。安全に進めるには、まず現在のMetric Streams出力量、namespace別の利用状況、metric name別の参照有無、dimensionの多さを確認し、そのうえで `include_filter` を段階的に導入するのがよい。
+監視コストを下げるためには、後段のダッシュボードやアラートを整理するだけではなく、Metric Streams の入口で何を送るかを明示することが重要である。
 
 ## 参考
 - https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/CloudWatch-Metric-Streams.html
 - https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/cloudwatch_metric_stream
-- https://aws.amazon.com/about-aws/whats-new/2023/08/amazon-cloudwatch-metric-streams-filtering-metric-name/
-- https://www.datadoghq.com/blog/custom-metrics-governance/
-- https://docs.datadoghq.com/account_management/billing/custom_metrics/
+- https://aws.amazon.com/about-aws/whats-new/2023/05/amazon-cloudwatch-metric-streams-filtering-name/
 
 ---
 Generated: 2026-05-28
